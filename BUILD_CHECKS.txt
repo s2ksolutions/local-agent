@@ -18,3 +18,16 @@ test_budget.py functional scenarios (stubbed model, no Ollama): PASS
   3. different failing actions -> correction at 6 rounds, stop at 10
   4. segment exhausted with no progress -> paused_budget with loop hint
 Live Windows/Ollama/browser end-to-end: NOT RUN
+--- 0.2.3 task contract / evidence / write policy checks ---
+runtime.py/app.py: syntax PASS
+Reported local-module import: PASS
+Frontend JavaScript: syntax PASS (app.js, panel_actions.js)
+test_contract.py functional scenarios (stubbed model, no Ollama): PASS
+  1. contract + valid evidence for all requirements -> completed_verified
+  2. one requirement without evidence -> completed_unverified with explicit warning
+  3. verify_requirement with unrecorded evidence id -> tool failure, run unverified
+  4. second submit_contract cannot remove existing requirements
+  5. write policy: sections-only edits accepted, harness/outside changes rejected before
+     disk, denied file rejected, invalid JSON rejected, trailing newline rejected
+test_budget.py regression: PASS
+Live Windows/Ollama/browser end-to-end: NOT RUN

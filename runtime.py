@@ -17,9 +17,53 @@ from qwen_compat import normalize, validate, CompatibilityError
 from browser import _safe_url
 from browser_tools import BrowserTools, BROWSER_SPECS, BROWSER_NAMES, BROWSER_READ_ONLY
 groups = ['workspaces', 'agents', 'prompts', 'workflows', 'scheduler', 'files', 'checkpoints', 'browser', 'models', 'activity', 'approvals', 'memory', 'artifacts', 'runtime_health']
-SPECS = [('list_files', 'List workspace files', {}, [], 'files'), ('read_file', 'Read workspace UTF-8 file', {'path': {'type': 'string'}}, ['path'], 'files'), ('write_file', 'Write file with checkpoint and read-back verification', {'path': {'type': 'string'}, 'content': {'type': 'string'}}, ['path', 'content'], 'files'), ('search_memory', 'Search pinned and retrieved memory', {'query': {'type': 'string'}}, ['query'], 'memory'), ('save_memory', 'Save proposed workspace memory', {'title': {'type': 'string'}, 'value': {'type': 'string'}}, ['title', 'value'], 'memory'), ('search_prompts', 'Search prompt templates', {'query': {'type': 'string'}}, ['query'], 'prompts'), ('create_prompt', 'Create prompt template', {'name': {'type': 'string'}, 'content': {'type': 'string'}}, ['name', 'content'], 'prompts'), ('create_workflow', 'Create editable workflow DRAFT', {'name': {'type': 'string'}, 'nodes': {'type': 'array', 'items': {'type': 'object'}}, 'edges': {'type': 'array', 'items': {'type': 'object'}}}, ['name', 'nodes', 'edges'], 'workflows'), ('propose_schedule', 'Propose daily schedule for approval', {'name': {'type': 'string'}, 'task': {'type': 'string'}, 'time': {'type': 'string'}, 'timezone': {'type': 'string'}}, ['name', 'task', 'time', 'timezone'], 'scheduler'), ('list_artifacts', 'List artifacts', {}, [], 'artifacts')] + BROWSER_SPECS
+SPECS = [('list_files', 'List workspace files', {}, [], 'files'), ('read_file', 'Read workspace UTF-8 file', {'path': {'type': 'string'}}, ['path'], 'files'), ('write_file', 'Write file with checkpoint and read-back verification', {'path': {'type': 'string'}, 'content': {'type': 'string'}}, ['path', 'content'], 'files'), ('search_memory', 'Search pinned and retrieved memory', {'query': {'type': 'string'}}, ['query'], 'memory'), ('save_memory', 'Save proposed workspace memory', {'title': {'type': 'string'}, 'value': {'type': 'string'}}, ['title', 'value'], 'memory'), ('search_prompts', 'Search prompt templates', {'query': {'type': 'string'}}, ['query'], 'prompts'), ('create_prompt', 'Create prompt template', {'name': {'type': 'string'}, 'content': {'type': 'string'}}, ['name', 'content'], 'prompts'), ('create_workflow', 'Create editable workflow DRAFT', {'name': {'type': 'string'}, 'nodes': {'type': 'array', 'items': {'type': 'object'}}, 'edges': {'type': 'array', 'items': {'type': 'object'}}}, ['name', 'nodes', 'edges'], 'workflows'), ('propose_schedule', 'Propose daily schedule for approval', {'name': {'type': 'string'}, 'task': {'type': 'string'}, 'time': {'type': 'string'}, 'timezone': {'type': 'string'}}, ['name', 'task', 'time', 'timezone'], 'scheduler'), ('submit_contract', 'Propose the task checklist. Requirements become fixed once recorded; later calls can only add items, never remove or weaken them.', {'requirements': {'type': 'array', 'items': {'type': 'object', 'properties': {'description': {'type': 'string'}, 'required': {'type': 'boolean'}}, 'required': ['description'], 'additionalProperties': False}}}, ['requirements'], 'activity'), ('verify_requirement', 'Record evidence that a checklist requirement is satisfied. Evidence IDs appear in successful tool results as evidence_id.', {'requirement': {'type': 'string'}, 'evidence': {'type': 'array', 'items': {'type': 'string'}}}, ['requirement', 'evidence'], 'activity'), ('list_artifacts', 'List artifacts', {}, [], 'artifacts')] + BROWSER_SPECS
 TOOLS = [{'type': 'function', 'function': {'name': n, 'description': d, 'parameters': {'type': 'object', 'properties': p, 'required': required, 'additionalProperties': False}}} for n, d, p, required, group in SPECS]
-SAFE = {'list_files', 'read_file', 'search_memory', 'search_prompts', 'list_artifacts'} | set(BROWSER_READ_ONLY)
+SAFE = {'list_files', 'read_file', 'search_memory', 'search_prompts', 'list_artifacts', 'submit_contract', 'verify_requirement'} | set(BROWSER_READ_ONLY)
+
+def validate_policy_write(path, current, proposed, policy):
+    """Reject a write before it reaches disk when it violates the run's write policy."""
+    mode = policy.get('mode', 'allow')
+    if mode == 'deny':
+        raise ValueError('Write rejected by policy: ' + path + ' is protected for this run and may not be modified.')
+    if mode == 'sections':
+        markers = policy.get('markers') or []
+        if not markers:
+            raise ValueError('Write policy error: sections mode requires marker pairs.')
+        def outside(text):
+            spans = []
+            for start, end in markers:
+                first = text.find(start)
+                if first < 0:
+                    raise ValueError('Write rejected: required section marker is missing from ' + path + ': ' + start[:80])
+                last = text.find(end, first + len(start))
+                if last < 0:
+                    raise ValueError('Write rejected: section end marker is missing from ' + path + ': ' + end[:80])
+                spans.append((first, last + len(end)))
+            spans.sort()
+            for index in range(1, len(spans)):
+                if spans[index][0] < spans[index - 1][1]:
+                    raise ValueError('Write rejected: overlapping protected-section markers in ' + path + '.')
+            parts = []
+            previous = 0
+            for first, last in spans:
+                parts.append(text[previous:first])
+                previous = last
+            parts.append(text[previous:])
+            return ''.join(parts), len(spans)
+        current_outside, current_count = outside(current)
+        proposed_outside, proposed_count = outside(proposed)
+        if proposed_count != current_count:
+            raise ValueError('Write rejected: protected sections in ' + path + ' may not be added or removed.')
+        if current_outside != proposed_outside:
+            raise ValueError('Write rejected: content outside the permitted sections of ' + path + ' changed. Only the permitted application sections may be edited.')
+    if policy.get('validJson'):
+        try:
+            json.loads(proposed)
+        except Exception as error:
+            raise ValueError('Write rejected: ' + path + ' must remain valid JSON (' + str(error) + ').')
+    if policy.get('noTrailingNewline') and proposed.endswith('\n'):
+        raise ValueError('Write rejected: ' + path + ' must not end with a trailing newline (exact-byte rule).')
 
 class IncompleteRunError(RuntimeError):
     pass
@@ -305,7 +349,7 @@ class Runtime:
             return agent.get('allowWorkflow', False)
         return True
 
-    def submit(self, workspace, agent_id, text, images=None, workflow=None, metadata=None):
+    def submit(self, workspace, agent_id, text, images=None, workflow=None, metadata=None, write_policy=None):
         self.s.project(workspace)
         agent = self.s.get('agent', agent_id)
         images = images or []
@@ -328,7 +372,7 @@ class Runtime:
         history = sorted([message for message in self.s.all('message', workspace) if conversation_id and message.get('conversation') == conversation_id and (message.get('role') in ('user', 'assistant'))], key=lambda message: message.get('created', 0))[-12:]
         history = [{'role': message['role'], 'content': message.get('text', '')[:5000]} for message in history]
         id = uid()
-        run = self.s.put('run', id, {'workspace': workspace, 'agent': agent_id, 'active_agent': agent_id, 'task': text, 'images': images, 'status': 'queued', 'created': time.time(), 'snapshot': {'agent': agent, 'workspace': self.s.get('workspace', workspace), 'workflow': workflow, 'prompts': self.s.all('prompt'), 'history': history, 'node_agents': {node['agent']: self.s.get('agent', node['agent']) for node in (workflow or {}).get('nodes', [])}}, 'states': {}, 'outputs': {}, 'metadata': metadata, 'attempts': 0, 'warnings': []}, workspace)
+        run = self.s.put('run', id, {'workspace': workspace, 'agent': agent_id, 'active_agent': agent_id, 'task': text, 'images': images, 'status': 'queued', 'created': time.time(), 'snapshot': {'agent': agent, 'workspace': self.s.get('workspace', workspace), 'workflow': workflow, 'prompts': self.s.all('prompt'), 'history': history, 'node_agents': {node['agent']: self.s.get('agent', node['agent']) for node in (workflow or {}).get('nodes', [])}}, 'states': {}, 'outputs': {}, 'metadata': metadata, 'attempts': 0, 'warnings': [], 'write_policy': write_policy or {}}, workspace)
         self.tasks[id] = asyncio.create_task(self.work(run))
         return run
 
@@ -439,7 +483,11 @@ class Runtime:
             self.persist(run)
             raise
         state['active_effect'] = None
-        state.setdefault('successful_tools', []).append({'tool': name, 'arguments': queue_copy(args), 'result': result})
+        evidence_id = 'ev-' + str(run.get('evidence_seq', 0) + 1)
+        run['evidence_seq'] = int(evidence_id[3:])
+        run.setdefault('evidence', {})[evidence_id] = {'tool': name, 'arguments': queue_copy(args), 'result_excerpt': dump(result)[:2000], 'time': time.time()}
+        state['last_evidence'] = evidence_id
+        state.setdefault('successful_tools', []).append({'tool': name, 'arguments': queue_copy(args), 'result': result, 'evidence_id': evidence_id})
         self.wire(run, 'inbound', 'tool.' + name, result)
         self.event(run, 'tool.completed', {'tool': name, 'arguments': trace_value(args), 'status': 'succeeded', 'result': trace_value(result)})
         return result
@@ -455,7 +503,51 @@ class Runtime:
                 raise ValueError('Read budget exceeded')
             return path.read_text(encoding='utf-8')
         if name == 'write_file':
+            policy = ((run.get('write_policy') or {}).get('files') or {}).get(args['path'])
+            if policy:
+                target = self.s.path(workspace, args['path'])
+                current = target.read_text(encoding='utf-8') if target.exists() else ''
+                validate_policy_write(args['path'], current, args['content'], policy)
             return self.s.write(workspace, args['path'], args['content'].encode())
+        if name == 'submit_contract':
+            incoming = []
+            for entry in args['requirements']:
+                description = str(entry.get('description', '')).strip()
+                if not description:
+                    raise ValueError('Each requirement needs a non-empty description.')
+                incoming.append({'description': description, 'required': bool(entry.get('required', True))})
+            if not 1 <= len(incoming) <= 20:
+                raise ValueError('A contract needs between 1 and 20 requirements.')
+            contract = run.get('contract')
+            if not contract:
+                run['contract'] = {'revision': 1, 'requirements': [{'id': 'r' + str(index + 1), 'description': item['description'], 'required': item['required'], 'state': 'pending', 'evidence_refs': []} for index, item in enumerate(incoming)]}
+                result = {'status': 'recorded', 'note': 'Requirements are now fixed for this run. Later submit_contract calls can add requirements but never remove or weaken existing ones.', 'requirements': run['contract']['requirements']}
+            else:
+                existing = {item['description'] for item in contract['requirements']}
+                added = [item for item in incoming if item['description'] not in existing]
+                for item in added:
+                    contract['requirements'].append({'id': 'r' + str(len(contract['requirements']) + 1), 'description': item['description'], 'required': item['required'], 'state': 'pending', 'evidence_refs': []})
+                contract['revision'] += 1
+                result = {'status': 'updated' if added else 'unchanged', 'added': [item['description'] for item in added], 'note': 'Existing requirements cannot be removed or weakened.', 'requirements': contract['requirements']}
+            self.event(run, 'contract.submitted', {'revision': run['contract']['revision'], 'requirements': [item['id'] + ': ' + item['description'] for item in run['contract']['requirements']]})
+            return result
+        if name == 'verify_requirement':
+            contract = run.get('contract')
+            if not contract:
+                raise ValueError('No contract recorded for this run; call submit_contract first.')
+            requirement = next((item for item in contract['requirements'] if item['id'] == args['requirement'] or item['description'] == args['requirement']), None)
+            if not requirement:
+                raise ValueError('Unknown requirement: ' + args['requirement'] + '. Known: ' + ', '.join(item['id'] for item in contract['requirements']) + '.')
+            if not args['evidence']:
+                raise ValueError('At least one recorded evidence ID is required; a textual claim is not evidence.')
+            evidence = run.get('evidence') or {}
+            missing = [item for item in args['evidence'] if item not in evidence]
+            if missing:
+                raise ValueError('Evidence not recorded in this run: ' + ', '.join(missing) + '. Reference evidence_id values from successful tool results.')
+            requirement['state'] = 'satisfied'
+            requirement['evidence_refs'] = list(args['evidence'])
+            self.event(run, 'requirement.verified', {'requirement': requirement['id'], 'description': requirement['description'], 'evidence': [{'id': item, 'tool': evidence[item]['tool']} for item in args['evidence']]})
+            return {'status': 'recorded', 'requirement': requirement['id'], 'evidence': [{'id': item, 'tool': evidence[item]['tool']} for item in args['evidence']]}
         if name == 'search_memory':
             return await self.memory_search(workspace, agent, args['query'])
         if name == 'save_memory':
@@ -602,7 +694,7 @@ class Runtime:
                     arguments = json.loads(arguments)
                 try:
                     result = await self.tool(run, agent, name, arguments, state)
-                    item = {'status': 'succeeded', 'result': result}
+                    item = {'status': 'succeeded', 'result': result, 'evidence_id': state.get('last_evidence')}
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
@@ -750,9 +842,18 @@ class Runtime:
                 answer = dump(run['outputs'])
             else:
                 answer = await self.infer_agent(run, 'chat', run['snapshot']['agent'], run['task'], run.get('images', []))
-            run.update(status='completed_with_warning' if run.get('warnings') else 'completed', answer=answer, finished=time.time())
+            status = 'completed_with_warning' if run.get('warnings') else 'completed'
+            contract = run.get('contract')
+            if contract and contract.get('requirements'):
+                unmet = [item for item in contract['requirements'] if item.get('required', True) and item.get('state') != 'satisfied']
+                if not unmet:
+                    status = 'completed_verified'
+                else:
+                    status = 'completed_unverified'
+                    run.setdefault('warnings', []).append('Unverified requirements: ' + '; '.join(item['id'] + ' ' + item['description'] for item in unmet) + '. Work was performed, but these required checks have no recorded evidence.')
+            run.update(status=status, answer=answer, finished=time.time())
             self.persist(run)
-            self.event(run, 'run.completed', {'answer': answer, 'warnings': run.get('warnings', [])})
+            self.event(run, 'run.completed', {'answer': answer, 'status': status, 'warnings': run.get('warnings', []), 'verified_requirements': [item['id'] for item in (contract or {}).get('requirements', []) if item.get('state') == 'satisfied']})
             self.save_reply(run, answer)
         except asyncio.CancelledError:
             unsafe = any((state.get('active_effect') for state in run.get('states', {}).values()))
@@ -788,7 +889,7 @@ class Runtime:
         finally:
             if self.tasks.get(run['id']) is asyncio.current_task():
                 self.tasks.pop(run['id'], None)
-            if run.get('status') in ('completed', 'completed_with_warning', 'cancelled', 'failed', 'incomplete', 'paused_budget', 'needs_reconciliation'):
+            if run.get('status') in ('completed', 'completed_with_warning', 'completed_verified', 'completed_unverified', 'cancelled', 'failed', 'incomplete', 'paused_budget', 'needs_reconciliation'):
                 for approval in self.s.all('approval', run['workspace']):
                     if approval.get('run') == run['id'] and approval.get('status') == 'pending' and (approval.get('action') in ('tool.execute', 'node.execute')):
                         approval['status'] = 'cancelled'

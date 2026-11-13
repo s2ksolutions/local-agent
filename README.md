@@ -1,4 +1,20 @@
-# Local Agent 0.2.2 — progress-aware, resumable execution budget
+# Local Agent 0.2.3 — task contract, evidence gate and write policy
+
+## Task contract, evidence and completion gate (new in 0.2.3)
+
+- Agents propose a task checklist with the `submit_contract` tool; the application validates it (1–20 non-empty requirements) and records it on the run. Once recorded, requirements are fixed: later calls can only add items, never remove or weaken them.
+- Every successful tool execution receives an evidence ID (`evidence_id` in the tool result) and is recorded in the run's evidence ledger with its arguments and result excerpt.
+- `verify_requirement` marks a requirement satisfied only when it references evidence IDs actually recorded in this run — a textual "everything passed" claim is not evidence, and unknown evidence IDs are rejected as tool failures.
+- The completion gate runs on recorded state, not the final message. With a contract: all required requirements satisfied with valid evidence -> `completed_verified`; otherwise `completed_unverified` with an explicit warning listing each unverified requirement. Runs without a contract keep the existing `completed` / `completed_with_warning` statuses.
+
+## Write policy (new in 0.2.3)
+
+- `POST /api/runs` accepts an optional `writePolicy` scoped to the run: per-file rules enforced before a write reaches disk.
+  - `{"mode": "deny"}` — the file (e.g. a diagnostic harness) may not be modified at all.
+  - `{"mode": "sections", "markers": [["<!-- APP START -->", "<!-- APP END -->"]]}` — only content inside the marker pairs may change; everything else, including the markers and their count, must remain byte-identical.
+  - `{"validJson": true}` — the proposed content must parse as JSON (e.g. profile data).
+  - `{"noTrailingNewline": true}` — exact-byte rule; a trailing newline is rejected.
+- Rejected writes fail as tool errors and leave the file untouched; they are recorded separately from accepted repair cycles.
 
 ## Budget and continuation (new in 0.2.2)
 

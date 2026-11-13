@@ -349,7 +349,7 @@ async def run(request: Request):
     workspace = body['workspace']
     agent = s.get('agent', body['agent'])
     images = [(image if isinstance(image, str) else image['data']).split(',', 1)[-1] for image in body.get('images', [])]
-    result = runtime.submit(workspace, agent['id'], body.get('text', ''), images, metadata={'conversation': body.get('conversation')})
+    result = runtime.submit(workspace, agent['id'], body.get('text', ''), images, metadata={'conversation': body.get('conversation')}, write_policy=body.get('writePolicy'))
     s.put('message', uid(), {'workspace': workspace, 'conversation': body.get('conversation'), 'role': 'user',
           'text': body.get('text', ''), 'agent': agent['id'], 'model': agent['modelConfig']['model'],
           'images': body.get('images', []), 'run': result['id'], 'created': time.time()}, workspace)
