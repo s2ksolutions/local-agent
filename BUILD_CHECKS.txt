@@ -1,0 +1,10 @@
+browser.py: syntax PASS
+runtime.py: syntax PASS
+store.py: syntax PASS
+app.py: syntax PASS
+Reported local-module import: PASS
+Frontend JavaScript: syntax PASS
+Root route: static/index.html (full unified application, not console)
+Live Windows/Ollama/GPU/browser/vault/scheduler recovery: NOT RUN
+No long-running test suite performed
+Database initialization and runtime construction: PASS
