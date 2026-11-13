@@ -80,8 +80,10 @@ async def scenario_unverified(tmp):
         tool_call('submit_contract', {'requirements': [{'description': 'Do A'}, {'description': 'Do B'}]}),
         tool_call('list_files', {}),
         tool_call('verify_requirement', {'requirement': 'r1', 'evidence': ['ev-1']}),
-        final('Everything passed.'),  # claim without evidence for r2
-    ][n - 1])
+        final('Everything passed.'),  # claim without evidence for r2: nudged twice, then accepted
+        final('Really, everything passed.'),
+        final('I insist it passed.'),
+    ][min(n, 6) - 1])
     run = runtime.submit('ws1', 'a1', 'Fix and verify')
     await drive(runtime, run['id'])
     stored = s.get('run', run['id'])
@@ -99,7 +101,9 @@ async def scenario_bogus_evidence(tmp):
         tool_call('submit_contract', {'requirements': [{'description': 'Do A'}]}),
         tool_call('verify_requirement', {'requirement': 'r1', 'evidence': ['ev-99']}),
         final('Trust me, it works.'),
-    ][n - 1])
+        final('Really, trust me.'),
+        final('It definitely works.'),
+    ][min(n, 5) - 1])
     run = runtime.submit('ws1', 'a1', 'Verify')
     await drive(runtime, run['id'])
     stored = s.get('run', run['id'])
@@ -115,7 +119,9 @@ async def scenario_no_removal(tmp):
         tool_call('submit_contract', {'requirements': [{'description': 'Keep me'}, {'description': 'Me too'}]}),
         tool_call('submit_contract', {'requirements': [{'description': 'Keep me'}]}),  # attempt to drop the second
         final('Done.'),
-    ][n - 1])
+        final('Done again.'),
+        final('Done for real.'),
+    ][min(n, 5) - 1])
     run = runtime.submit('ws1', 'a1', 'Contract test')
     await drive(runtime, run['id'])
     stored = s.get('run', run['id'])

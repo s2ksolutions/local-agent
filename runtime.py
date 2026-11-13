@@ -184,7 +184,64 @@ class Runtime:
     def budget_limits(self, browser):
         config = self.config() or {}
         segment = int(config.get('segmentRequests', 32 if browser else 12))
-        return {'segment': max(1, segment), 'total': max(segment, int(config.get('maxModelRequests', segment * 8))), 'segments': max(1, int(config.get('maxSegments', 8))), 'repair': max(1, int(config.get('maxRepairCycles', 10)))}
+        return {'segment': max(1, segment), 'total': max(segment, int(config.get('maxModelRequests', segment * 8))), 'segments': max(1, int(config.get('maxSegments', 8))), 'repair': max(1, int(config.get('maxRepairCycles', 10))), 'elapsed': max(0.0, float(config.get('maxElapsedSeconds', 3600)))}
+
+    def compact_messages(self, messages, agent):
+        """Compact old conversation rounds to fit the context budget.
+
+        Whole rounds are compacted (an assistant tool-call message never loses its
+        results); the task framing, a compaction note, evidence IDs and the most
+        recent rounds stay verbatim. Returns stats dict when compaction happened.
+        """
+        def size():
+            return sum(len(str(message.get('content', ''))) + len(dump(message.get('tool_calls') or [])) for message in messages)
+        config = self.config() or {}
+        limit = int(config.get('compactAfterChars', 0)) or max(8000, int(agent['modelConfig'].get('context', 4096)) * 3)
+        before = size()
+        if before <= limit or len(messages) <= 4:
+            return None
+        first_assistant = next((index for index, message in enumerate(messages) if message.get('role') == 'assistant'), None)
+        if first_assistant is None:
+            return None
+        def is_boundary(index):
+            message = messages[index]
+            return message.get('role') == 'user' or (message.get('role') == 'assistant' and (message.get('tool_calls') or []))
+        cut = None
+        for tail in (4, 2):
+            for index in range(len(messages) - tail, first_assistant, -1):
+                if index > first_assistant and is_boundary(index):
+                    cut = index
+                    break
+            if cut is not None:
+                break
+        if cut is None or cut <= first_assistant:
+            return None
+        def shorten(text, keep):
+            text = str(text)
+            return text if len(text) <= keep else text[:keep] + ' …[compacted]'
+        compacted = []
+        for message in messages[first_assistant:cut]:
+            role = message.get('role')
+            if role == 'tool':
+                match = re.search(r'"evidence_id":\s*"(ev-\d+)"', str(message.get('content', '')))
+                compacted.append({**message, 'content': '[compacted tool result] ' + shorten(re.sub(r'\s+', ' ', str(message.get('content', ''))), 200) + (' (evidence: ' + match.group(1) + ')' if match else '')})
+            elif role == 'assistant' and (message.get('tool_calls') or []):
+                calls = []
+                for call in message['tool_calls']:
+                    arguments = call.get('function', {}).get('arguments')
+                    if isinstance(arguments, dict):
+                        arguments = {key: shorten(value, 160) if isinstance(value, str) else value for key, value in arguments.items()}
+                    calls.append({**call, 'function': {**call.get('function', {}), 'arguments': arguments}})
+                compacted.append({**message, 'content': shorten(message.get('content', ''), 300), 'tool_calls': calls})
+            else:
+                compacted.append({**message, 'content': shorten(message.get('content', ''), 400)})
+        note = {'role': 'user', 'content': '[context compacted] Older conversation rounds were summarized to fit the context budget; evidence IDs are preserved and remain valid for verify_requirement. The task, contract and the most recent rounds are intact. Do not rely on details removed from older tool results; re-read files or re-inspect state if needed.'}
+        messages[:] = messages[:first_assistant] + [note] + compacted + messages[cut:]
+        if size() > limit:  # the tail itself is oversized: truncate old tool results there too
+            for index in range(cut + 1, len(messages)):
+                if messages[index].get('role') == 'tool':
+                    messages[index] = {**messages[index], 'content': shorten(re.sub(r'\s+', ' ', str(messages[index].get('content', ''))), 300)}
+        return {'before_chars': before, 'after_chars': size(), 'kept_verbatim': len(messages) - cut, 'compacted_rounds': len(compacted)}
 
     def event(self, run, event_type, data):
         return self.s.event(run['id'], event_type, data)
@@ -402,6 +459,7 @@ class Runtime:
         budget['failure_streak'] = 0
         budget['last_failure_sig'] = None
         budget['repeat_correction'] = False
+        budget['started'] = time.time()
         run['status'] = 'queued'
         run.pop('error', None)
         run['attempts'] = 0
@@ -684,6 +742,9 @@ class Runtime:
                     raise BudgetPausedError('Execution budget ' + ('exhausted without segment progress (possible loop); ' if not budget['segment_progress'] else 'exhausted; ') + 'model requests ' + str(budget['model_requests']) + ', tool executions ' + str(budget['tool_executions']) + ', repair cycles ' + str(budget['repair_cycles']) + '. Saved run state can continue with the Continue action.')
             if budget['model_requests'] >= budget['total_limit']:
                 raise BudgetPausedError('Total model-request budget reached (' + str(budget['model_requests']) + ' requests, ' + str(budget['tool_executions']) + ' tool executions, ' + str(budget['repair_cycles']) + ' repair cycles). Saved run state can continue with the Continue action.')
+            elapsed = time.time() - budget.get('started', time.time())
+            if limits['elapsed'] and elapsed > limits['elapsed']:
+                raise BudgetPausedError('Elapsed-time limit reached (' + str(int(elapsed)) + 's of ' + str(int(limits['elapsed'])) + 's allowed; ' + str(budget['model_requests']) + ' model requests, ' + str(budget['tool_executions']) + ' tool executions). Saved run state can continue with the Continue action, which starts a fresh time window.')
             round_succeeded = False
             round_failed = False
             while state.get('pending_calls'):
@@ -751,10 +812,14 @@ class Runtime:
             state['step'] = budget['model_requests']
             run['status'] = 'running'
             self.persist(run)
-            self.event(run, 'model.started', {'node': key, 'model': model, 'step': budget['model_requests'], 'model_requests': budget['model_requests'], 'segment_requests': budget['segment_requests'], 'tool_executions': budget['tool_executions'], 'repair_cycles': budget['repair_cycles']})
+            self.event(run, 'model.started', {'node': key, 'model': model, 'step': budget['model_requests'], 'model_requests': budget['model_requests'], 'segment_requests': budget['segment_requests'], 'tool_executions': budget['tool_executions'], 'repair_cycles': budget['repair_cycles'], 'elapsed_ms': int((time.time() - budget.get('started', time.time())) * 1000)})
             current_agent = self.s.get('agent', agent['id'])
             allowed = [tool for tool in TOOLS if self.permitted(current_agent, tool['function']['name'])]
             validate_tool_history(messages)
+            compaction = self.compact_messages(messages, agent)
+            if compaction:
+                self.event(run, 'context.compacted', {'node': key, **compaction, 'note': 'Older rounds summarized; evidence IDs, contract and recent rounds preserved. Tool-call pairing kept intact.'})
+                self.persist(run)
             wire_messages = list(messages)
             if current_agent.get('browser') and 'browser' in current_agent.get('capabilities', groups):
                 try:
@@ -785,6 +850,15 @@ class Runtime:
                     return self.response_warning(run, state, answer, 'empty final reply')
                 if self.request_continuation(run, key, state, answer):
                     continue
+                contract = run.get('contract')
+                if contract and contract.get('requirements'):
+                    pending = [item for item in contract['requirements'] if item.get('required', True) and item.get('state') != 'satisfied']
+                    if pending and state.get('contract_nudges', 0) < 2:
+                        state['contract_nudges'] = state.get('contract_nudges', 0) + 1
+                        messages.append({'role': 'user', 'content': 'The final answer was not accepted yet: required checklist items have no recorded evidence: ' + '; '.join(item['id'] + ' ' + item['description'] for item in pending) + '. Continue the original task with the offered tools and record evidence with verify_requirement (it accepts evidence_id values from successful tool results). If a requirement is genuinely impossible, state exactly what blocks it instead of claiming success.'})
+                        self.event(run, 'model.contract_correction', {'node': key, 'attempt': state['contract_nudges'], 'pending': [item['id'] for item in pending]})
+                        self.persist(run)
+                        continue
                 state['answer'] = answer
                 self.persist(run)
                 return answer

@@ -31,3 +31,14 @@ test_contract.py functional scenarios (stubbed model, no Ollama): PASS
      disk, denied file rejected, invalid JSON rejected, trailing newline rejected
 test_budget.py regression: PASS
 Live Windows/Ollama/browser end-to-end: NOT RUN
+--- 0.2.4 context compaction / elapsed budget / contract correction checks ---
+runtime.py/app.py: syntax PASS
+Reported local-module import: PASS
+test_context.py functional scenarios (stubbed model, no Ollama): PASS
+  1. compaction: repeated large reads stay bounded after the first full read;
+     evidence IDs preserved in compacted results; tool-call pairing intact; run completes
+  2. elapsed-time limit -> paused_budget; Continue opens a fresh window and completes
+  3. unevidenced final answer -> at most two contract corrections, then completed_unverified
+  4. model recovers after nudge with real evidence -> completed_verified
+test_budget.py + test_contract.py regression: PASS
+Live Windows/Ollama/browser end-to-end: NOT RUN

@@ -1,4 +1,10 @@
-# Local Agent 0.2.3 — task contract, evidence gate and write policy
+# Local Agent 0.2.4 — context compaction, elapsed budget and contract correction
+
+## Context and time management (new in 0.2.4)
+
+- Context compaction: when the message history exceeds the context budget (`compactAfterChars`, or 3x the agent's context tokens by default), older conversation rounds are summarized — tool results become short excerpts that keep their evidence IDs, and oversized arguments are truncated. The task framing, a compaction note, the contract and the most recent rounds stay verbatim. An assistant tool-call message never loses its results, so the Ollama tool-call protocol stays intact across compaction. Evidence IDs remain valid for `verify_requirement` after compaction.
+- Elapsed-time budget: runs are additionally bounded by wall-clock time (`maxElapsedSeconds`, default 3600). Exceeding it ends the run as `paused_budget`; Continue starts a fresh time window with the same saved state. `elapsed_ms` is recorded on every `model.started` event.
+- Contract correction: a final answer is not accepted while required checklist items have no recorded evidence. The runtime sends at most two explicit corrections listing the pending items and how to record evidence, then completes as `completed_unverified` — a confident "everything passed" message alone can never produce `completed_verified`.
 
 ## Task contract, evidence and completion gate (new in 0.2.3)
 
