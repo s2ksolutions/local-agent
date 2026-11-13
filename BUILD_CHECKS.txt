@@ -42,3 +42,13 @@ test_context.py functional scenarios (stubbed model, no Ollama): PASS
   4. model recovers after nudge with real evidence -> completed_verified
 test_budget.py + test_contract.py regression: PASS
 Live Windows/Ollama/browser end-to-end: NOT RUN
+--- 0.2.5 Ollama auto-start checks ---
+runtime.py/app.py: syntax PASS
+Reported local-module import: PASS
+test_autostart.py functional scenarios (fake ollama executable, no real Ollama): PASS
+  1. no server running -> autostart_owned launches an owned process (pid recorded, health owned_pid set)
+  2. reachable external server -> never taken over; autostart reports 'external'
+  3. repeated failed starts -> restart budget exhausted error; external mode refuses auto-start
+  4. watchdog health_loop auto-starts an owned server after the configured delay
+Regression (budget/contract/context suites): PASS
+Live Windows/Ollama end-to-end: NOT RUN

@@ -273,12 +273,37 @@ class Runtime:
                 await asyncio.sleep(5)
                 continue
             await self.health_check()
-            if config.get('mode') == 'managed' and config.get('autoRestart') and (self.process is not None) and (self.health['state'] == 'unreachable') and (self.health['failures'] >= config['failureThreshold']) and self.bad_since and (time.time() - self.bad_since >= config['grace']) and (not self.gpu.locked()):
+            if config.get('mode') == 'managed' and (self.health['state'] == 'unreachable') and (self.health['failures'] >= config['failureThreshold']) and self.bad_since and (not self.gpu.locked()):
                 try:
-                    await self.restart_owned()
+                    if (self.process is not None) and config.get('autoRestart') and (time.time() - self.bad_since >= config['grace']):
+                        await self.restart_owned()
+                    elif (self.process is None) and config.get('autoStart', True) and (time.time() - self.bad_since >= config.get('autoStartDelay', 15)):
+                        await self.autostart_owned()
                 except Exception as error:
                     self.health.update(state='needs_attention', last_error=str(error))
             await asyncio.sleep(config['interval'])
+
+    async def autostart_owned(self):
+        """Start an owned server when none is running. An existing external server is
+        never killed or taken over; a reachable one means there is nothing to do."""
+        async with self.recovery:
+            config = self.config()
+            if config['mode'] != 'managed':
+                raise ValueError('Managed mode required for auto-start')
+            if self.process and self.process.poll() is None:
+                return {'pid': self.process.pid, 'state': 'already_owned'}
+            if (await self.health_check())['state'] == 'api_reachable':
+                return {'state': 'external', 'note': 'Server already reachable; ownership not assumed'}
+            now = time.time()
+            while self.restart_times and now - self.restart_times[0] > config['restartWindow']:
+                self.restart_times.popleft()
+            if len(self.restart_times) >= config['maxRestarts']:
+                raise ValueError('Auto-start budget exhausted (' + str(config['maxRestarts']) + ' attempts within ' + str(config['restartWindow']) + 's). Check ollama-managed.log; an occupied port or missing executable will keep failing.')
+            first = not self.restart_times
+            self.restart_times.append(now)
+            if not first:
+                await asyncio.sleep(min(config['maxBackoff'], config['initialBackoff'] * 2 ** (len(self.restart_times) - 1)))
+            return await self._start_owned()
 
     async def start_owned(self):
         async with self.recovery:

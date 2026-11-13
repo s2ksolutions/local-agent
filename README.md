@@ -1,4 +1,10 @@
-# Local Agent 0.2.4 — context compaction, elapsed budget and contract correction
+# Local Agent 0.2.5 — Ollama auto-start
+
+## Ollama auto-start (new in 0.2.5)
+
+- In managed mode, the watchdog now starts an owned Ollama server automatically when none is running (`autoStart`, default on; `autoStartDelay`, default 15s of unreachable). Fresh installs default to managed mode; existing installs get `autoStart` added on upgrade — switch mode to `managed` in Runtime health → Watchdog settings to enable it.
+- Ownership rules are unchanged: a reachable external server is never killed or taken over; the owned server binds the configured localhost endpoint; logs go to `ollama-managed.log` in the data directory.
+- Auto-start attempts share the restart budget (`maxRestarts` within `restartWindow`) with exponential backoff, so a missing executable or occupied port cannot spawn processes forever. The manual Start/Restart buttons and their approval flow remain.
 
 ## Context and time management (new in 0.2.4)
 

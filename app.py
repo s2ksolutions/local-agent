@@ -75,12 +75,14 @@ if not s.all('workspace'):
 if not s.get('setting', 'runtime', False):
     s.put('setting', 'runtime', {
         'endpoint': 'http://127.0.0.1:11434',
-        'mode': 'external',
+        'mode': 'managed',
         'enabled': True,
         'interval': 10,
         'probeTimeout': 5,
         'failureThreshold': 3,
         'grace': 45,
+        'autoStart': True,
+        'autoStartDelay': 15,
         'loadTimeout': 300,
         'stallTimeout': 180,
         'maxRestarts': 3,
@@ -93,6 +95,11 @@ if not s.get('setting', 'runtime', False):
         'embeddingModel': 'embeddinggemma',
         'vectorEnabled': False,
     })
+
+_runtime_setting = s.get('setting', 'runtime', False)
+if _runtime_setting and 'autoStart' not in _runtime_setting:
+    _runtime_setting.update(autoStart=True, autoStartDelay=15)
+    s.put('setting', 'runtime', _runtime_setting)
 
 if not s.get('setting', 'resources', False):
     s.put('setting', 'resources', {
