@@ -8,3 +8,13 @@ Root route: static/index.html (full unified application, not console)
 Live Windows/Ollama/GPU/browser/vault/scheduler recovery: NOT RUN
 No long-running test suite performed
 Database initialization and runtime construction: PASS
+--- 0.2.2 progress-aware budget checks ---
+runtime.py/app.py: syntax PASS
+Reported local-module import: PASS
+Frontend JavaScript: syntax PASS (app.js, panel_actions.js)
+test_budget.py functional scenarios (stubbed model, no Ollama): PASS
+  1. segment auto-renewal on progress -> paused_budget at total cap -> Continue resumes SAME run to completion (messages/tool history preserved, pending call dispatched first)
+  2. identical failing action x3 -> change-approach correction; x4 -> stop
+  3. different failing actions -> correction at 6 rounds, stop at 10
+  4. segment exhausted with no progress -> paused_budget with loop hint
+Live Windows/Ollama/browser end-to-end: NOT RUN

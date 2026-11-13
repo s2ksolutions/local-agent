@@ -369,6 +369,11 @@ def terminal(workspace: str, run: str | None = None, after: int = 0):
     return s.events(run, after, workspace)
 
 
+@app.post('/api/runs/{ident}/continue')
+def continue_run(ident: str):
+    return runtime.continue_run(ident)
+
+
 @app.post('/api/runs/{ident}/cancel')
 def cancel(ident: str):
     item = s.get('run', ident)

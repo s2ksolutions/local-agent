@@ -1,4 +1,14 @@
-# Local Agent 0.2.1 — complete corrected local-testing package
+# Local Agent 0.2.2 — progress-aware, resumable execution budget
+
+## Budget and continuation (new in 0.2.2)
+
+- A "step" is one model request. Separate recorded counters replace the single step count: model requests, tool executions, repair cycles (accepted edits), and per-segment progress. They are shown on every `model.started` event and on pause events.
+- Per-segment limit stays 12 model requests without browser access, 32 with it (configurable: `segmentRequests`). When a segment is exhausted but useful progress was recorded (any successful tool execution), the runtime automatically renews the segment and continues the same task — same messages, same tool-call history, no resubmission. Up to `maxSegments` renewals (default 8) within a total cap of `maxModelRequests` (default 8x the segment limit).
+- Total-cap or no-progress exhaustion ends the run as `paused_budget` (not failed, not completed). The saved run keeps the original task, messages, tool-call history, results and pending calls. `POST /api/runs/{id}/continue` (also offered in the UI) resumes that exact run state with a fresh grant — it never resubmits the original prompt as a new task. An unexecuted pending tool call is dispatched first on resume, never silently dropped.
+- Loop protection: the same action failing identically three times triggers an explicit change-approach instruction; a fourth identical failure stops the run. Six consecutive all-failure model rounds trigger a diagnose instruction; ten stop it. A segment with zero successful tool executions is not renewed.
+- Repair cycles (accepted `write_file` edits) are counted separately and capped (`maxRepairCycles`, default 10).
+- Generic non-validation runtime errors (not budget/loop stops, not ValueErrors) now get the same bounded two-attempt recovery retry as transport errors, so transient failures do not end a run that was making progress.
+- Tool-call history integrity is unchanged: assistant tool calls and their results are always returned to the next model request; loop-correction instructions are only inserted after a completed tool result, never between a call and its result.
 
 ## Fixes in this package
 

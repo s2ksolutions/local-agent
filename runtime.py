@@ -24,6 +24,9 @@ SAFE = {'list_files', 'read_file', 'search_memory', 'search_prompts', 'list_arti
 class IncompleteRunError(RuntimeError):
     pass
 
+class BudgetPausedError(IncompleteRunError):
+    pass
+
 class _RuntimeBrowserTools(BrowserTools):
     """Apply the active workflow node's permissions rather than the parent agent's."""
 
@@ -125,6 +128,19 @@ class Runtime:
 
     def persist(self, run):
         self.s.put('run', run['id'], run, run['workspace'])
+
+    def budget(self, run):
+        """Separate execution counters: one opaque step count is not enough."""
+        current = run.get('budget')
+        if isinstance(current, dict) and current.get('version') == 2:
+            return current
+        run['budget'] = {'version': 2, 'model_requests': current.get('model_requests', 0) if isinstance(current, dict) else 0, 'tool_executions': 0, 'repair_cycles': 0, 'segments': 0, 'segment_requests': 0, 'segment_progress': False, 'consecutive_no_progress': 0, 'no_progress_correction': False, 'failure_streak': 0, 'last_failure_sig': None, 'repeat_correction': False, 'total_limit': None, 'started': time.time()}
+        return run['budget']
+
+    def budget_limits(self, browser):
+        config = self.config() or {}
+        segment = int(config.get('segmentRequests', 32 if browser else 12))
+        return {'segment': max(1, segment), 'total': max(segment, int(config.get('maxModelRequests', segment * 8))), 'segments': max(1, int(config.get('maxSegments', 8))), 'repair': max(1, int(config.get('maxRepairCycles', 10)))}
 
     def event(self, run, event_type, data):
         return self.s.event(run['id'], event_type, data)
@@ -314,6 +330,41 @@ class Runtime:
         id = uid()
         run = self.s.put('run', id, {'workspace': workspace, 'agent': agent_id, 'active_agent': agent_id, 'task': text, 'images': images, 'status': 'queued', 'created': time.time(), 'snapshot': {'agent': agent, 'workspace': self.s.get('workspace', workspace), 'workflow': workflow, 'prompts': self.s.all('prompt'), 'history': history, 'node_agents': {node['agent']: self.s.get('agent', node['agent']) for node in (workflow or {}).get('nodes', [])}}, 'states': {}, 'outputs': {}, 'metadata': metadata, 'attempts': 0, 'warnings': []}, workspace)
         self.tasks[id] = asyncio.create_task(self.work(run))
+        return run
+
+    def continue_run(self, ident):
+        """Resume a stopped run's saved state with a fresh budget. Never a fresh task."""
+        run = self.s.get('run', ident)
+        task = self.tasks.get(run['id'])
+        if task and (not task.done()):
+            raise ValueError('Run is already active')
+        if run.get('status') not in ('paused_budget', 'incomplete', 'failed'):
+            raise ValueError('Only paused_budget, incomplete or failed runs can continue')
+        if any((state.get('active_effect') for state in run.get('states', {}).values())):
+            run.update(status='needs_reconciliation', error='Cannot continue: an earlier action may have taken effect but its outcome is uncertain. Inspect the actual browser/files state first.')
+            self.persist(run)
+            raise ValueError('Run needs reconciliation before it can continue')
+        budget = self.budget(run)
+        agent = run['snapshot'].get('agent') or self.s.get('agent', run['agent'])
+        browser = self.permitted(agent, 'browser_tabs')
+        limits = self.budget_limits(browser)
+        grant = max(limits['segment'], int((self.config() or {}).get('continueGrant', limits['segment'] * 2)))
+        budget['total_limit'] = max(budget.get('total_limit') or 0, budget.get('model_requests', 0)) + grant
+        budget['segments'] = 0
+        budget['segment_requests'] = 0
+        budget['segment_progress'] = False
+        budget['consecutive_no_progress'] = 0
+        budget['no_progress_correction'] = False
+        budget['failure_streak'] = 0
+        budget['last_failure_sig'] = None
+        budget['repeat_correction'] = False
+        run['status'] = 'queued'
+        run.pop('error', None)
+        run['attempts'] = 0
+        run['recovery_attempt'] = run.get('recovery_attempt', 0) + 1
+        self.event(run, 'run.continue_requested', {'grant': grant, 'budget': {key: value for key, value in budget.items() if key != 'started'}, 'note': 'Resuming the saved run state: original task, messages, tool-call history, results and tab references. This is not a resubmission.'})
+        self.persist(run)
+        self.tasks[run['id']] = asyncio.create_task(self.work(run))
         return run
 
     def resume_saved(self):
@@ -519,8 +570,30 @@ class Runtime:
         model = override or config['model']
         if model not in config['allowed']:
             raise ValueError('Model outside allowlist')
-        step_limit = 32 if self.permitted(self.s.get('agent', agent['id']), 'browser_tabs') else 12
-        while state.get('step', 0) < step_limit:
+        browser = self.permitted(self.s.get('agent', agent['id']), 'browser_tabs')
+        budget = self.budget(run)
+        limits = self.budget_limits(browser)
+        if budget['total_limit'] is None:
+            budget['total_limit'] = limits['total']
+        while True:
+            if budget['segment_requests'] >= limits['segment']:
+                if budget['segment_progress'] and budget['model_requests'] < budget['total_limit'] and budget['segments'] < limits['segments']:
+                    budget['segments'] += 1
+                    budget['segment_requests'] = 0
+                    budget['segment_progress'] = False
+                    budget['consecutive_no_progress'] = 0
+                    budget['no_progress_correction'] = False
+                    budget['failure_streak'] = 0
+                    budget['last_failure_sig'] = None
+                    budget['repeat_correction'] = False
+                    self.event(run, 'run.budget_segment', {'node': key, 'segment': budget['segments'], 'model_requests': budget['model_requests'], 'tool_executions': budget['tool_executions'], 'repair_cycles': budget['repair_cycles'], 'note': 'Budget segment renewed because useful progress was recorded; the original task and tool history continue unchanged.'})
+                    self.persist(run)
+                else:
+                    raise BudgetPausedError('Execution budget ' + ('exhausted without segment progress (possible loop); ' if not budget['segment_progress'] else 'exhausted; ') + 'model requests ' + str(budget['model_requests']) + ', tool executions ' + str(budget['tool_executions']) + ', repair cycles ' + str(budget['repair_cycles']) + '. Saved run state can continue with the Continue action.')
+            if budget['model_requests'] >= budget['total_limit']:
+                raise BudgetPausedError('Total model-request budget reached (' + str(budget['model_requests']) + ' requests, ' + str(budget['tool_executions']) + ' tool executions, ' + str(budget['repair_cycles']) + ' repair cycles). Saved run state can continue with the Continue action.')
+            round_succeeded = False
+            round_failed = False
             while state.get('pending_calls'):
                 call = state['pending_calls'][0]
                 name = call['function']['name']
@@ -538,16 +611,55 @@ class Runtime:
                     item = {'status': 'failed', 'error': str(error)}
                     state.setdefault('failed_tools', []).append({'tool': name, 'arguments': arguments, **item})
                     self.event(run, 'tool.completed', {'tool': name, 'arguments': trace_value(arguments), **item})
+                failed = item['status'] != 'succeeded'
+                streak = 0
+                if not failed:
+                    round_succeeded = True
+                    budget['tool_executions'] += 1
+                    budget['segment_progress'] = True
+                    budget['consecutive_no_progress'] = 0
+                    budget['failure_streak'] = 0
+                    budget['last_failure_sig'] = None
+                    budget['repeat_correction'] = False
+                    if name == 'write_file':
+                        budget['repair_cycles'] += 1
+                        if budget['repair_cycles'] > limits['repair']:
+                            raise IncompleteRunError('Repair-cycle limit reached (' + str(limits['repair']) + ' accepted edits). Change approach or report what is blocking instead of editing again.')
+                else:
+                    round_failed = True
+                    signature = digest({'tool': name, 'arguments': arguments})
+                    budget['failure_streak'] = budget['failure_streak'] + 1 if signature == budget.get('last_failure_sig') else 1
+                    budget['last_failure_sig'] = signature
+                    streak = budget['failure_streak']
                 messages.append({'role': 'tool', 'tool_name': name, 'content': tool_message(item)})
                 state['pending_calls'].pop(0)
                 self.persist(run)
+                if streak >= 4:
+                    raise IncompleteRunError('The same action failed identically ' + str(streak) + ' times in a row. A changed approach is required before another attempt.')
+                if streak == 3 and not budget.get('repeat_correction'):
+                    budget['repeat_correction'] = True
+                    messages.append({'role': 'user', 'content': 'The same action just failed identically three times. Do not repeat it unchanged. Change your approach, inspect the actual error and current state, or clearly state what is blocking.'})
+                    self.event(run, 'run.loop_correction', {'node': key, 'kind': 'repeated_identical_failure', 'tool': name})
+            if round_succeeded:
+                budget['consecutive_no_progress'] = 0
+                budget['no_progress_correction'] = False
+            elif round_failed:
+                budget['consecutive_no_progress'] += 1
+                if budget['consecutive_no_progress'] >= 10:
+                    raise IncompleteRunError('Ten consecutive model rounds produced only failed tool calls with no successful action. Remaining work is not verified; inspect the errors and change approach.')
+                if budget['consecutive_no_progress'] >= 6 and not budget.get('no_progress_correction'):
+                    budget['no_progress_correction'] = True
+                    messages.append({'role': 'user', 'content': 'The last several attempts all failed. Stop repeating them. Diagnose the actual error with available read/inspection tools, then use a different approach or report exactly what is blocking.'})
+                    self.event(run, 'run.loop_correction', {'node': key, 'kind': 'no_progress_window', 'rounds': budget['consecutive_no_progress']})
             run['status'] = 'queued'
             self.persist(run)
             self.event(run, 'model.queued', {'node': key, 'model': model})
-            state['step'] = state.get('step', 0) + 1
+            budget['model_requests'] += 1
+            budget['segment_requests'] += 1
+            state['step'] = budget['model_requests']
             run['status'] = 'running'
             self.persist(run)
-            self.event(run, 'model.started', {'node': key, 'model': model, 'step': state['step']})
+            self.event(run, 'model.started', {'node': key, 'model': model, 'step': budget['model_requests'], 'model_requests': budget['model_requests'], 'segment_requests': budget['segment_requests'], 'tool_executions': budget['tool_executions'], 'repair_cycles': budget['repair_cycles']})
             current_agent = self.s.get('agent', agent['id'])
             allowed = [tool for tool in TOOLS if self.permitted(current_agent, tool['function']['name'])]
             validate_tool_history(messages)
@@ -588,7 +700,6 @@ class Runtime:
                 raise ValueError('Excessive tool calls')
             state['pending_calls'] = queue_copy(calls)
             self.persist(run)
-        raise IncompleteRunError('Model step limit reached; remaining requested work is not verified.')
 
     async def work(self, run):
         try:
@@ -653,7 +764,9 @@ class Runtime:
             self.save_reply(run, run.get('error', 'Run cancelled. Completed actions remain recorded; inspect Activity before retrying.'))
         except Exception as error:
             unsafe = any((state.get('active_effect') for state in run['states'].values()))
-            retry = not unsafe and self.config().get('autoResume', True) and (run.get('attempts', 0) < 2) and isinstance(error, (httpx.TransportError, httpx.HTTPStatusError)) and (not (isinstance(error, httpx.HTTPStatusError) and error.response.status_code < 500))
+            transportish = isinstance(error, (httpx.TransportError, httpx.HTTPStatusError)) and (not (isinstance(error, httpx.HTTPStatusError) and error.response.status_code < 500))
+            generic = not isinstance(error, (IncompleteRunError, ValueError, asyncio.CancelledError))
+            retry = not unsafe and self.config().get('autoResume', True) and (run.get('attempts', 0) < 2) and (transportish or generic)
             self.event(run, 'run.issue', {'error': str(error), 'traceback': traceback.format_exc(), 'safe_to_retry': retry})
             if retry:
                 run['attempts'] = run.get('attempts', 0) + 1
@@ -662,16 +775,20 @@ class Runtime:
                 await asyncio.sleep(min(30, 5 * 2 ** run['attempts']))
                 self.tasks[run['id']] = asyncio.create_task(self.work(run))
                 return
+            paused = isinstance(error, BudgetPausedError)
             incomplete = isinstance(error, IncompleteRunError)
-            status = 'needs_reconciliation' if unsafe else 'incomplete' if incomplete else 'failed'
+            status = 'needs_reconciliation' if unsafe else 'paused_budget' if paused else 'incomplete' if incomplete else 'failed'
             run.update(status=status, error=str(error), finished=time.time())
             self.persist(run)
-            self.event(run, 'run.incomplete' if incomplete and (not unsafe) else 'run.failed', {'error': str(error), 'needs_reconciliation': unsafe})
-            self.save_reply(run, ('Run incomplete: ' if incomplete else 'Run stopped: ') + str(error) + '\nCompleted actions remain recorded. Inspect Activity before resubmitting; do not blindly repeat actions.')
+            self.event(run, 'run.paused_budget' if paused and (not unsafe) else 'run.incomplete' if incomplete and (not unsafe) else 'run.failed', {'error': str(error), 'needs_reconciliation': unsafe, 'budget': {key: value for key, value in (run.get('budget') or {}).items() if key != 'started'}})
+            if paused and (not unsafe):
+                self.save_reply(run, 'Run paused at its execution budget: ' + str(error) + '\nThe saved run keeps the original task, checklist progress, tool-call history and results. Use Continue to resume it with a fresh budget; do not resubmit the task as a new run.')
+            else:
+                self.save_reply(run, ('Run incomplete: ' if incomplete else 'Run stopped: ') + str(error) + '\nCompleted actions remain recorded. Inspect Activity before resubmitting; do not blindly repeat actions.')
         finally:
             if self.tasks.get(run['id']) is asyncio.current_task():
                 self.tasks.pop(run['id'], None)
-            if run.get('status') in ('completed', 'completed_with_warning', 'cancelled', 'failed', 'incomplete', 'needs_reconciliation'):
+            if run.get('status') in ('completed', 'completed_with_warning', 'cancelled', 'failed', 'incomplete', 'paused_budget', 'needs_reconciliation'):
                 for approval in self.s.all('approval', run['workspace']):
                     if approval.get('run') == run['id'] and approval.get('status') == 'pending' and (approval.get('action') in ('tool.execute', 'node.execute')):
                         approval['status'] = 'cancelled'
